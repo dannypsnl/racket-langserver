@@ -8,7 +8,9 @@
 ;; - Do not place protocol JSON payload structs here; those belong in
 ;;   `interfaces.rkt` as `define-json-struct` types.
 
-(require racket/contract
+(require "check-syntax-compat.rkt"
+         "../common/interfaces.rkt"
+         racket/contract
          racket/dict
          racket/logging
          data/interval-map)
@@ -17,7 +19,10 @@
   ExpandResult
   ExpandResult?
   ExpandResult-logs
-  (struct-out Decl)
+  (struct-out Module-Binding)
+  (struct-out Doc-Contribution)
+  (struct-out Reference-Source)
+  (struct-out Document-Reference-Result)
   interval-map-of
   ExpandResult-pre-syntax
   ExpandResult-post-syntax
@@ -63,11 +68,32 @@
        (ExpandResult-post-syntax er)
        #t))
 
-(struct/contract Decl
-  ([filepath (or/c path-string? #f)]
-   [id (or/c symbol? #f)]
-   [left exact-nonnegative-integer?]
-   [right exact-nonnegative-integer?])
+;; Unique identity for a module-backed binding: filepath, submods, phase+space,
+;; and id.
+(struct/contract Module-Binding
+  ([filepath path?]
+   [submods (listof symbol?)]
+   [phase+space phase+space-shift?]
+   [id symbol?])
+  #:transparent)
+
+;; Immutable cross-file facts derived from one completed document analysis.
+(struct/contract Doc-Contribution
+  ([path path?]
+   [references (hash/c Module-Binding? (listof Location?) #:immutable #t)]
+   [definitions (hash/c Module-Binding? Location? #:immutable #t)])
+  #:transparent)
+
+;; Reference locations supplied by exactly one document.
+(struct/contract Reference-Source
+  ([path path?]
+   [locations (listof Location?)])
+  #:transparent)
+
+;; Live document references plus the exact cross-document identity, when any.
+(struct/contract Document-Reference-Result
+  ([source Reference-Source?]
+   [module-binding (or/c Module-Binding? #f)])
   #:transparent)
 
 (define (interval-map-of value/c)

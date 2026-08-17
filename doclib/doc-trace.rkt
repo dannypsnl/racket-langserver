@@ -1,42 +1,46 @@
 #lang racket/base
 
 (require racket/class
+         racket/dict
+         racket/match
          racket/set
          racket/string
          drracket/check-syntax
+         "check-syntax-compat.rkt"
          "service/completion.rkt"
          "service/hover/service.rkt"
          "service/docs.rkt"
          "service/require.rkt"
-         "service/definition.rkt"
          "service/diagnostic.rkt"
          "service/declaration.rkt"
          "service/highlight.rkt"
          "service/tooltip-log.rkt"
          "service/typed-racket/service.rkt"
-         "service/workspace-references.rkt"
-         "../common/interfaces.rkt")
+         "../common/interfaces.rkt"
+         "../common/path-util.rkt"
+         "internal-types.rkt")
 
 (define build-trace%
-  (class (annotations-mixin object%)
+  (class (check-syntax-annotations-mixin object%)
     (init-field src
                 doc-text
                 lexer-state)
     (define docs (new docs%))
     (define completions (new completion%))
     (define requires (new require%))
-    (define definitions (new definition% [src src]))
     (define diag (new diag%
                    [src src]
                    [doc-text doc-text]
                    [lexer-state lexer-state]))
-    (define decls (new declaration%))
+    (define decls
+      (new declaration%
+        [src src]
+        [doc-text doc-text]))
     (define hovers
       (new hover%
         [src src]
         [doc-text doc-text]
         [lexer-state lexer-state]))
-    (define workspace-references (new workspace-references% [src src] [doc-text doc-text]))
     (define semantic-tokens (new highlight% [src src] [doc-text doc-text]))
     (define typed-racket
       (new typed-racket%
@@ -48,11 +52,9 @@
             docs
             completions
             requires
-            definitions
             diag
             typed-racket
             decls
-            workspace-references
             semantic-tokens))
 
     (define/public (reset)
@@ -97,6 +99,36 @@
     (define/public (get-declaration) decls)
     (define/public (get-typed-racket) typed-racket)
 
+    ;; Derive accepted cross-file state from this trace's frozen editor.
+    (define/public (get-contribution)
+      (define (abs->pos pos)
+        (match-define (list line char)
+          (send doc-text pos->line/char pos))
+        (Pos line char))
+
+      (define (range->location range)
+        (define start (CharRange-start range))
+        (define end
+          (if (= start (CharRange-end range))
+              (add1 start)
+              (CharRange-end range)))
+        (Location (path->uri src)
+                  (Range (abs->pos start) (abs->pos end))))
+
+      (define references
+        (for/fold ([references (hash)])
+                  ([entry (in-list (send decls module-binding-uses))])
+          (define range (car entry))
+          (define module-binding (cdr entry))
+          (hash-update references
+                       module-binding
+                       (lambda (locations) (cons (range->location range) locations))
+                       '())))
+      (define definitions
+        (for/hash ([entry (in-list (send decls module-binding-definitions))])
+          (values (cdr entry) (range->location (car entry)))))
+      (Doc-Contribution src references definitions))
+
     ;; Chosen over putting Typed Racket type-error diagnostics on diag%:
     ;; inferred types and type errors share one online-check-syntax channel
     ;; owned by typed-racket%. Union both sets here for LSP publish.
@@ -125,12 +157,8 @@
     (define/public (get-online-completions str-before-cursor)
       (send completions get-online-completions str-before-cursor))
     (define/public (get-requires) (send requires get))
-    (define/public (get-sym-decls) (car (send decls get)))
-    (define/public (get-sym-bindings) (cadr (send decls get)))
-    (define/public (get-definitions) (send definitions get))
     (define/public (get-quickfixs) (cadr (send diag get)))
     (define/public (get-semantic-tokens) (send semantic-tokens get))
-    (define/public (get-workspace-bindings uri symbol) (find-workspace-bindings uri symbol))
 
     ;; Overrides
     (define/override (syncheck:find-source-object stx)
@@ -138,9 +166,15 @@
            src))
 
     ;; Definitions
-    (define/override (syncheck:add-definition-target src-obj start end id mods)
+    (define/override (syncheck:add-definition-target/phase-level+space
+                       src-obj start end id mods phase+space)
       (for ([s services])
-        (send s syncheck:add-definition-target src-obj start end id mods)))
+        (send s syncheck:add-definition-target/phase-level+space
+              src-obj start end id mods phase+space)))
+
+    (define/override (syncheck:unused-binder src-obj left right)
+      (for ([s services])
+        (send s syncheck:unused-binder src-obj left right)))
 
     ;; Track requires
     (define/override (syncheck:add-require-open-menu text start finish file)
@@ -160,9 +194,11 @@
       (for ([s services])
         (send s syncheck:add-docs-menu text start finish id label path def-tag url-tag)))
 
-    (define/override (syncheck:add-jump-to-definition src-obj start end id filename submods)
+    (define/override (syncheck:add-jump-to-definition/phase-level+space
+                       src-obj start end id filename submods phase+space)
       (for ([s services])
-        (send s syncheck:add-jump-to-definition src-obj start end id filename submods)))
+        (send s syncheck:add-jump-to-definition/phase-level+space
+              src-obj start end id filename submods phase+space)))
 
     ;; References
     (define/override (syncheck:add-arrow/name-dup _start-src-obj start-left start-right

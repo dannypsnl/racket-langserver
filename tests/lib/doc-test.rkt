@@ -5,13 +5,16 @@
            "../../doclib/doc.rkt"
            "../../doclib/hover.rkt"
            "../../doclib/doc-trace.rkt"
+           "../../doclib/check-syntax-compat.rkt"
            "../../doclib/check-syntax.rkt"
            "../../doclib/editor.rkt"
            "../../doclib/internal-types.rkt"
            "../../doclib/lexer.rkt"
            "../../common/interfaces.rkt"
+           "../../common/path-util.rkt"
            racket/class
            racket/file
+           drracket/check-syntax
            data/interval-map)
 
   (test-case
@@ -19,6 +22,7 @@
     (define d (make-doc "file:///test.rkt" "hello world"))
     (check-equal? (Doc-version d) 0)
     (check-equal? (Doc-uri d) "file:///test.rkt")
+    (check-false (Doc-contribution d))
     (check-equal? (doc-get-text d) "hello world"))
 
   (test-case
@@ -617,17 +621,416 @@
     (define text "#lang racket\n(define x 1)\nx")
     (with-output-to-file tmp-file #:exists 'replace (lambda () (display text)))
 
-    (define def-range (doc-get-definition-by-id tmp-file 'x))
+    (define def-range (doc-get-definition-by-id tmp-file '() 0 'x))
     (check-pred Range? def-range)
 
     (delete-file tmp-file))
+
+  (test-case
+    "Get definition uses exact submodule and phase identity"
+    (define tmp-file (make-temporary-file "binding-identity~a.rkt"))
+    (define text
+      (string-append
+        "#lang racket/base\n"
+        "(module first racket/base\n"
+        "  (define same 1))\n"
+        "(module second racket/base\n"
+        "  (require (for-syntax racket/base))\n"
+        "  (begin-for-syntax\n"
+        "    (define same 2)))\n"))
+    (with-output-to-file tmp-file
+      #:exists 'replace
+      (lambda ()
+        (display text)))
+
+    (define first-range
+      (doc-get-definition-by-id tmp-file '(first) 0 'same))
+    (define second-range
+      (doc-get-definition-by-id tmp-file '(second) 1 'same))
+    (check-equal? first-range (Range (Pos 2 10) (Pos 2 14)))
+    (check-equal? second-range (Range (Pos 6 12) (Pos 6 16)))
+
+    (delete-file tmp-file))
+
+  (test-case
+    "binding identity distinguishes equal symbols across submodules and phases"
+    (define path (string->path "/tmp/binding-identity-test.rkt"))
+    (define uri "file:///tmp/binding-identity-test.rkt")
+    (define text (make-string 40 #\space))
+    (define doc-text (new lsp-editor%))
+    (send doc-text insert text 0)
+    (define trace
+      (new build-trace%
+        [src path]
+        [doc-text doc-text]
+        [lexer-state (build-lexer-state text uri)]))
+
+    (send trace
+          syncheck:add-jump-to-definition/phase-level+space
+          path 1 2 'same path '(first) 0)
+    (send trace
+          syncheck:add-jump-to-definition/phase-level+space
+          path 3 4 'same path '(second) 1)
+    (send trace
+          syncheck:add-definition-target/phase-level+space
+          path 10 11 'same '(first) 0)
+    (send trace
+          syncheck:add-definition-target/phase-level+space
+          path 20 21 'same '(second) 1)
+
+    (define declaration-service (send trace get-declaration))
+    (define first-binding (Module-Binding path '(first) 0 'same))
+    (define second-binding (Module-Binding path '(second) 1 'same))
+    (define first-target (send declaration-service module-binding-at 1))
+    (define second-target (send declaration-service module-binding-at 3))
+    (check-equal? first-target first-binding)
+    (check-equal? second-target second-binding)
+    (check-equal? (send declaration-service definition-at 1)
+                  (CharRange 10 11))
+    (check-equal? (send declaration-service definition-at 3)
+                  (CharRange 20 21))
+    (define definitions
+      (Doc-Contribution-definitions (send trace get-contribution)))
+    (check-equal? (hash-ref definitions first-binding)
+                  (Location uri (Range (Pos 0 10) (Pos 0 11))))
+    (check-equal? (hash-ref definitions second-binding)
+                  (Location uri (Range (Pos 0 20) (Pos 0 21))))
+
+    (send trace expand 0 2)
+    (define shifted-target (send declaration-service module-binding-at 3))
+    (check-equal? shifted-target first-binding)
+    (check-equal? (send declaration-service definition-at 3)
+                  (CharRange 12 13))
+    (send trace contract 0 2)
+    (define restored-target (send declaration-service module-binding-at 1))
+    (check-equal? restored-target first-binding)
+    (check-equal? (send declaration-service definition-at 1)
+                  (CharRange 10 11)))
+
+  (test-case
+    "trace contribution groups module uses by exact binding identity"
+    (define path (string->path "/tmp/contribution-test.rkt"))
+    (define uri "file:///tmp/contribution-test.rkt")
+    (define text "first use\nsecond use\n")
+    (define doc-text (new lsp-editor%))
+    (send doc-text insert text 0)
+    (define trace
+      (new build-trace%
+        [src path]
+        [doc-text doc-text]
+        [lexer-state (build-lexer-state text uri)]))
+
+    (send trace
+          syncheck:add-jump-to-definition/phase-level+space
+          path 0 5 'same path '(first) 0)
+    (send trace
+          syncheck:add-jump-to-definition/phase-level+space
+          path 10 16 'same path '(first) 0)
+    (send trace
+          syncheck:add-jump-to-definition/phase-level+space
+          path 17 20 'same path '(second) 1)
+    ;; Local lexical bindings are not cross-file contribution entries.
+    (send trace
+          syncheck:add-arrow/name-dup
+          path 6 9 path 21 21 #t 0 #f #f)
+
+    (define contribution (send trace get-contribution))
+    (define references (Doc-Contribution-references contribution))
+    (define declaration-service (send trace get-declaration))
+    (define first-module-binding (Module-Binding path '(first) 0 'same))
+    (define second-module-binding (Module-Binding path '(second) 1 'same))
+    (check-equal? (Doc-Contribution-path contribution) path)
+    (check-true (immutable? references))
+    (check-equal? (hash-count references) 2)
+    (check-equal?
+      (sort (hash-ref references first-module-binding)
+            <
+            #:key (lambda (location)
+                    (Pos-line (Range-start (Location-range location)))))
+      (list (Location uri (Range (Pos 0 0) (Pos 0 5)))
+            (Location uri (Range (Pos 1 0) (Pos 1 6)))))
+    (check-equal? (hash-ref references second-module-binding)
+                  (list (Location uri (Range (Pos 1 7) (Pos 1 10)))))
+    (check-equal? (send declaration-service uses-at 0)
+                  (list (CharRange 0 5) (CharRange 10 16)))
+    (check-false (send declaration-service definition-at 0))
+
+    (define d (make-doc uri text 7))
+    (doc-update-trace! d trace contribution 7)
+    (check-eq? (Doc-contribution d) contribution)
+    (check-true (doc-trace-latest? d))
+    (define installed-target (doc-module-binding-at d (Pos 0 0)))
+    (check-equal? installed-target first-module-binding))
+
+  (test-case
+    "named binding queries resolve local and same-file module uses after edits"
+    (define path (string->path "/tmp/binding-query-test.rkt"))
+    (define text (make-string 50 #\space))
+    (define doc-text (new lsp-editor%))
+    (send doc-text insert text 0)
+    (define trace
+      (new build-trace%
+        [src path]
+        [doc-text doc-text]
+        [lexer-state (build-lexer-state text (path->uri path))]))
+    (send trace
+          syncheck:add-definition-target/phase-level+space
+          path 5 6 'module-name '() 0)
+    (send trace
+          syncheck:add-arrow/name-dup
+          path 5 6 path 10 11 #t 0 #f #f)
+    (send trace
+          syncheck:add-arrow/name-dup
+          path 5 6 path 20 21 #t 0 #f #f)
+    (send trace
+          syncheck:add-arrow/name-dup
+          path 30 31 path 35 36 #t 0 #f #f)
+    (send trace
+          syncheck:add-arrow/name-dup
+          path 30 31 path 40 41 #t 0 #f #f)
+    (send trace
+          syncheck:add-arrow/name-dup
+          path 30 31 path 45 46 #t 0 #t #f)
+
+    (define declaration-service (send trace get-declaration))
+    (define module-binding (Module-Binding path '() 0 'module-name))
+    (define module-target (send declaration-service module-binding-at 10))
+    (check-equal? module-target module-binding)
+    (check-false (send declaration-service module-binding-at 35))
+    (check-false (send declaration-service occurrence-at 45))
+    (check-equal? (send declaration-service occurrence-at 30)
+                  (CharRange 30 31))
+    (check-equal? (send declaration-service uses-at 10)
+                  (list (CharRange 10 11) (CharRange 20 21)))
+    (check-equal? (send declaration-service uses-at 35)
+                  (list (CharRange 35 36) (CharRange 40 41)))
+    (check-equal? (send declaration-service definition-at 35)
+                  (CharRange 30 31))
+
+    (send trace expand 0 2)
+    (check-equal? (send declaration-service occurrence-at 37)
+                  (CharRange 37 38))
+    (check-equal? (send declaration-service uses-at 12)
+                  (list (CharRange 12 13) (CharRange 22 23)))
+    (check-equal? (send declaration-service definition-at 12)
+                  (CharRange 7 8))
+    (check-equal? (send declaration-service definition-at 37)
+                  (CharRange 32 33))
+    (check-equal? (send declaration-service uses-at 37)
+                  (list (CharRange 37 38) (CharRange 42 43))))
+
+  (test-case
+    "declaration collection is independent of callback order"
+    (define path (string->path "/tmp/binding-callback-order-test.rkt"))
+    (define text (make-string 40 #\space))
+    (define doc-text (new lsp-editor%))
+    (send doc-text insert text 0)
+    (define trace
+      (new build-trace%
+        [src path]
+        [doc-text doc-text]
+        [lexer-state (build-lexer-state text (path->uri path))]))
+
+    ;; Same-file jump first, then attach the definition's module identity.
+    (send trace
+          syncheck:add-jump-to-definition/phase-level+space
+          path 10 11 'arrow-first path '() 0)
+    (send trace
+          syncheck:add-definition-target/phase-level+space
+          path 5 6 'arrow-first '() 0)
+
+    ;; Definition first, then collect its same-file jump.
+    (send trace
+          syncheck:add-definition-target/phase-level+space
+          path 20 21 'definition-first '() 0)
+    (send trace
+          syncheck:add-jump-to-definition/phase-level+space
+          path 25 26 'definition-first path '() 0)
+    ;; A target with no arrows still has a queryable definition occurrence.
+    (send trace
+          syncheck:add-definition-target/phase-level+space
+          path 30 31 'unused '() 0)
+
+    (define declaration-service (send trace get-declaration))
+    (define arrow-first-binding (Module-Binding path '() 0 'arrow-first))
+    (define definition-first-binding (Module-Binding path '() 0 'definition-first))
+    (for ([position (in-list (list 5 10))])
+      (check-equal? (send declaration-service module-binding-at position)
+                    arrow-first-binding))
+    (for ([position (in-list (list 20 25))])
+      (check-equal? (send declaration-service module-binding-at position)
+                    definition-first-binding))
+    (check-equal? (send declaration-service definition-at 10)
+                  (CharRange 5 6))
+    (check-equal? (send declaration-service definition-at 25)
+                  (CharRange 20 21))
+    (check-equal? (send declaration-service uses-at 5)
+                  (list (CharRange 10 11)))
+    (check-equal? (send declaration-service uses-at 20)
+                  (list (CharRange 25 26)))
+    (check-equal? (send declaration-service occurrence-at 30)
+                  (CharRange 30 31))
+    (check-equal? (send declaration-service definition-at 30)
+                  (CharRange 30 31))
+    (check-equal? (send declaration-service module-binding-at 30)
+                  (Module-Binding path '() 0 'unused))
+    (check-equal? (send declaration-service uses-at 30) '())
+    (check-equal?
+      (for/hash ([entry (in-list (send declaration-service module-binding-uses))])
+        (values (car entry) (cdr entry)))
+      (hash (CharRange 10 11) arrow-first-binding
+            (CharRange 25 26) definition-first-binding)))
+
+  (test-case
+    "a declaration moves once after an edit inside its range"
+    (define path (string->path "/tmp/binding-declaration-edit-test.rkt"))
+    (define text (make-string 50 #\space))
+    (define doc-text (new lsp-editor%))
+    (send doc-text insert text 0)
+    (define trace
+      (new build-trace%
+        [src path]
+        [doc-text doc-text]
+        [lexer-state (build-lexer-state text (path->uri path))]))
+    (send trace
+          syncheck:add-arrow/name-dup
+          path 30 33 path 35 38 #t 0 #f #f)
+    (define declaration-service (send trace get-declaration))
+
+    ;; Interior insertions extend the retained declaration range. Deleting the
+    ;; same text restores it, and the following edit must still move it once.
+    (send trace expand 31 32)
+    (check-equal? (send declaration-service occurrence-at 30)
+                  (CharRange 30 34))
+    (check-equal? (send declaration-service definition-at 33)
+                  (CharRange 30 34))
+    (check-equal? (send declaration-service occurrence-at 31)
+                  (CharRange 30 34))
+
+    (send trace contract 31 32)
+    (check-equal? (send declaration-service occurrence-at 30)
+                  (CharRange 30 33))
+    (check-equal? (send declaration-service definition-at 30)
+                  (CharRange 30 33))
+
+    (send trace expand 0 2)
+    (check-equal? (send declaration-service occurrence-at 32)
+                  (CharRange 32 35))
+    (check-equal? (send declaration-service definition-at 32)
+                  (CharRange 32 35))
+    (check-equal? (send declaration-service uses-at 32)
+                  (list (CharRange 37 40))))
+
+  (test-case
+    "a declaration replays several edits when first read"
+    (define path (string->path "/tmp/binding-declaration-replay-test.rkt"))
+    (define text (make-string 60 #\space))
+    (define doc-text (new lsp-editor%))
+    (send doc-text insert text 0)
+    (define trace
+      (new build-trace%
+        [src path]
+        [doc-text doc-text]
+        [lexer-state (build-lexer-state text (path->uri path))]))
+    (send trace
+          syncheck:add-arrow/name-dup
+          path 30 33 path 40 43 #t 0 #f #f)
+    (define declaration-service (send trace get-declaration))
+
+    (send trace expand 0 2)
+    (send trace expand 33 35)
+    (send trace contract 34 35)
+
+    (check-equal? (send declaration-service occurrence-at 32)
+                  (CharRange 32 36))
+    (check-equal? (send declaration-service definition-at 32)
+                  (CharRange 32 36))
+    (check-equal? (send declaration-service uses-at 32)
+                  (list (CharRange 43 46))))
+
+  (test-case
+    "deleting declaration text clips and then removes its local binding"
+    (define path (string->path "/tmp/binding-declaration-delete-test.rkt"))
+    (define text (make-string 60 #\space))
+    (define doc-text (new lsp-editor%))
+    (send doc-text insert text 0)
+    (define trace
+      (new build-trace%
+        [src path]
+        [doc-text doc-text]
+        [lexer-state (build-lexer-state text (path->uri path))]))
+    (send trace
+          syncheck:add-arrow/name-dup
+          path 30 35 path 40 43 #t 0 #f #f)
+    (define declaration-service (send trace get-declaration))
+
+    (send trace contract 32 37)
+    (check-equal? (send declaration-service definition-at 35)
+                  (CharRange 30 32))
+
+    (send trace contract 30 32)
+    (check-equal? (send declaration-service occurrence-at 33)
+                  (CharRange 33 36))
+    (check-false (send declaration-service definition-at 33)))
+
+  (test-case
+    "deleting a module declaration preserves its position-free binding"
+    (define path (string->path "/tmp/module-declaration-delete-test.rkt"))
+    (define text (make-string 40 #\space))
+    (define doc-text (new lsp-editor%))
+    (send doc-text insert text 0)
+    (define trace
+      (new build-trace%
+        [src path]
+        [doc-text doc-text]
+        [lexer-state (build-lexer-state text (path->uri path))]))
+    (send trace
+          syncheck:add-definition-target/phase-level+space
+          path 10 11 'module-name '() 0)
+    (send trace
+          syncheck:add-arrow/name-dup
+          path 10 11 path 20 21 #t 0 #f #f)
+    (define declaration-service (send trace get-declaration))
+    (define module-binding (Module-Binding path '() 0 'module-name))
+
+    (send trace contract 10 11)
+
+    (check-equal? (send declaration-service module-binding-at 19)
+                  module-binding)
+    (check-equal? (send declaration-service uses-at 19)
+                  (list (CharRange 19 20)))
+    (check-false (send declaration-service definition-at 19)))
+
+  (test-case
+    "failed expansion preserves the accepted contribution"
+    (define d
+      (make-doc "file:///tmp/contribution-lifecycle-test.rkt"
+                "#lang racket/base\n(require racket/list)\nfirst\n"))
+    (check-true (doc-expand! d))
+    (define accepted-contribution (Doc-contribution d))
+    (check-equal? (Doc-Contribution-path accepted-contribution)
+                  (string->path "/tmp/contribution-lifecycle-test.rkt"))
+    (check-true
+      (positive? (hash-count (Doc-Contribution-references accepted-contribution))))
+    (define accepted-pos (Pos 2 0))
+    (define accepted-target (doc-module-binding-at d accepted-pos))
+
+    (doc-apply-edit! d (Range (Pos 3 0) (Pos 3 0)) "(")
+    (check-false (doc-expand! d))
+    (check-eq? (Doc-contribution d) accepted-contribution)
+    (define preserved-target (doc-module-binding-at d accepted-pos))
+    (check-equal? preserved-target accepted-target)
+
+    (doc-reset! d "#lang racket/base\n42\n")
+    (check-true (doc-expand! d))
+    (check-not-eq? (Doc-contribution d) accepted-contribution))
 
   ;; Tests for newly extracted doc-* functions
   ;; All use a common expanded document:
   ;;   #lang racket
   ;;   (define x 1)
   ;;   x
-  ;;
+
   ;; Byte positions:
   ;;   Line 0: "#lang racket"   pos 0..12, newline at 12
   ;;   Line 1: "(define x 1)"   pos 13..25, newline at 25
@@ -679,59 +1082,76 @@ END
         (define/override (get-completions) '())
         (define/override (get-online-completions str-before-cursor)
           (hash-ref prefix->completions str-before-cursor '()))))
-    (doc-update-trace! d (new test-trace%) (Doc-version d))
+    (define trace (new test-trace%))
+    (doc-update-trace! d
+                       trace
+                       (send trace get-contribution)
+                       (Doc-version d))
     d)
 
   (test-case
-    "doc-get-decl on a binding usage"
+    "position queries on a binding usage"
     (define-values (d _uri) (make-expanded-doc))
-    ;; "x" at line 2, char 0 is a usage → resolves to local declaration
-    (define-values (start end decl) (doc-get-decl d (Pos 2 0)))
-    (check-equal? start 26 "usage start pos")
-    (check-equal? end 27 "usage end pos")
-    (check-false (Decl-filepath decl) "local binding has no filepath")
-    (check-equal? (Decl-left decl) 21 "declaration left pos")
-    (check-equal? (Decl-right decl) 22 "declaration right pos"))
+    ;; "x" at line 2, char 0 resolves to its same-file module identity.
+    (check-equal? (doc-occurrence-at d (Pos 2 0))
+                  (Range (Pos 2 0) (Pos 2 1)))
+    (define target (doc-module-binding-at d (Pos 2 0)))
+    (check-true (Module-Binding? target))
+    (check-equal? (Module-Binding-id target) 'x))
 
   (test-case
-    "doc-get-decl on the definition site"
+    "position queries on the definition site"
     (define-values (d _uri) (make-expanded-doc))
     ;; "x" in (define x 1) at line 1, char 8
-    (define-values (start end decl) (doc-get-decl d (Pos 1 8)))
-    (check-equal? start 21 "definition start pos")
-    (check-equal? end 22 "definition end pos")
-    (check-false (Decl-filepath decl) "local binding has no filepath")
-    (check-equal? (Decl-left decl) 21)
-    (check-equal? (Decl-right decl) 22))
+    (check-equal? (doc-occurrence-at d (Pos 1 8))
+                  (Range (Pos 1 8) (Pos 1 9)))
+    (define target (doc-module-binding-at d (Pos 1 8)))
+    (check-true (Module-Binding? target))
+    (check-equal? (Module-Binding-id target) 'x))
 
   (test-case
-    "doc-get-decl on imported 'define'"
+    "position queries on imported 'define'"
     (define-values (d _uri) (make-expanded-doc))
     ;; "define" at line 1, char 1 is an imported symbol
-    (define-values (start end decl) (doc-get-decl d (Pos 1 1)))
-    (check-equal? start 14 "imported define start pos")
-    (check-equal? end 20 "imported define end pos")
-    (check-not-false (Decl-filepath decl) "imported binding has a filepath")
-    ;; Imported symbols have left=0, right=0
-    (check-equal? (Decl-left decl) 0)
-    (check-equal? (Decl-right decl) 0))
+    (check-equal? (doc-occurrence-at d (Pos 1 1))
+                  (Range (Pos 1 1) (Pos 1 7)))
+    (define target (doc-module-binding-at d (Pos 1 1)))
+    (check-true (Module-Binding? target))
+    (check-equal? (Module-Binding-submods target) '())
+    (check-equal? (Module-Binding-phase+space target) 0)
+    ;; Check Syntax reports the target identifier, which may differ from the
+    ;; source spelling after a rename transformer.
+    (check-equal? (Module-Binding-id target) 'new-define))
 
   (test-case
-    "doc-get-decl on literal returns #f"
+    "position queries on literal return no occurrence"
     (define-values (d _uri) (make-expanded-doc))
     ;; "1" at line 1, char 10 is a literal
-    (define-values (_start _end decl) (doc-get-decl d (Pos 1 10)))
-    (check-false decl "literal should not have a declaration"))
+    (check-false (doc-occurrence-at d (Pos 1 10)))
+    (check-false (doc-module-binding-at d (Pos 1 10))))
 
   (test-case
-    "doc-get-bindings returns usage ranges for local x"
+    "uses-at returns usage ranges for local x"
     (define-values (d _uri) (make-expanded-doc))
-    (define-values (_s _e decl) (doc-get-decl d (Pos 2 0)))
-    (define bindings (doc-get-bindings d decl))
+    (define bindings (doc-uses-at d (Pos 2 0)))
     ;; Should contain exactly the usage of "x" at line 2, char 0..1
     (check-equal? (length bindings) 1)
     (check-equal? (first bindings)
                   (Range (Pos 2 0) (Pos 2 1))))
+
+  (test-case
+    "binding-ranges-at includes definition then uses for local x"
+    (define-values (d _uri) (make-expanded-doc))
+    (check-equal? (doc-binding-ranges-at d (Pos 2 0))
+                  (list (Range (Pos 1 8) (Pos 1 9))
+                        (Range (Pos 2 0) (Pos 2 1)))))
+
+  (test-case
+    "binding-ranges-at for imported define is uses only"
+    (define-values (d _uri) (make-expanded-doc))
+    (check-false (doc-definition-at d (Pos 1 1)))
+    (check-equal? (doc-binding-ranges-at d (Pos 1 1))
+                  (doc-uses-at d (Pos 1 1))))
 
   (test-case
     "doc-completion returns x in items"
@@ -827,28 +1247,316 @@ END
     (check-false result))
 
   (test-case
-    "doc-references for local x"
+    "doc-references returns a live source for same-document x"
     (define-values (d uri) (make-expanded-doc))
-    ;; "x" usage at (2,0) is a local binding, so doc-references returns bindings
+    ;; "x" at (2,0) resolves to a module binding and one live use in this document.
     (define result (doc-references d uri (Pos 2 0) #t))
-    (check-equal? (length result) 1)
-    (define ref (first result))
-    (check-equal? (Location-uri ref) uri)
-    (check-equal? (Location-range ref)
-                  (Range (Pos 2 0) (Pos 2 1))))
+    (check-true (Module-Binding? (Document-Reference-Result-module-binding result)))
+    (define source (Document-Reference-Result-source result))
+    (check-equal? (Reference-Source-path source) (uri->path uri))
+    (check-equal? (map Location-range (Reference-Source-locations source))
+                  (list (Range (Pos 1 8) (Pos 1 9))
+                        (Range (Pos 2 0) (Pos 2 1))))
+
+    (define uses-only (doc-references d uri (Pos 2 0) #f))
+    (check-equal?
+      (map Location-range
+           (Reference-Source-locations
+             (Document-Reference-Result-source uses-only)))
+      (list (Range (Pos 2 0) (Pos 2 1)))))
+
+  (test-case
+    "doc-references preserves local binding behavior"
+    (define uri "file:///tmp/doc-local-reference-test.rkt")
+    (define d
+      (make-doc uri
+                "#lang racket\n(let ([x 1])\n  x\n  x)\n"))
+    (check-true (doc-expand! d))
+
+    (define with-declaration (doc-references d uri (Pos 2 2) #t))
+    (check-false (Document-Reference-Result-module-binding with-declaration))
+    (check-equal?
+      (map Location-range
+           (Reference-Source-locations
+             (Document-Reference-Result-source with-declaration)))
+      (list (Range (Pos 1 7) (Pos 1 8))
+            (Range (Pos 2 2) (Pos 2 3))
+            (Range (Pos 3 2) (Pos 3 3))))
+
+    (define uses-only (doc-references d uri (Pos 2 2) #f))
+    (check-equal?
+      (map Location-range
+           (Reference-Source-locations
+             (Document-Reference-Result-source uses-only)))
+      (list (Range (Pos 2 2) (Pos 2 3))
+            (Range (Pos 3 2) (Pos 3 3)))))
+
+  (test-case
+    "doc-references shifts every live range while the accepted source stays stale"
+    (define uri "file:///tmp/doc-reference-edit-test.rkt")
+    (define d
+      (make-doc uri
+                "#lang racket\n(define x 1)\nx\nx\n"))
+    (check-true (doc-expand! d))
+    (define accepted-contribution (Doc-contribution d))
+    (define before-edit (doc-references d uri (Pos 2 0) #t))
+    (define module-binding
+      (Document-Reference-Result-module-binding before-edit))
+    (define accepted-ranges
+      (sort
+        (map Location-range
+             (hash-ref (Doc-Contribution-references accepted-contribution)
+                       module-binding))
+        <
+        #:key (lambda (range)
+                (Pos-line (Range-start range)))))
+    (check-equal?
+      accepted-ranges
+      (list (Range (Pos 2 0) (Pos 2 1))
+            (Range (Pos 3 0) (Pos 3 1))))
+
+    (doc-apply-edit! d (Range (Pos 1 0) (Pos 1 0)) ";; shift\n")
+
+    (define after-edit (doc-references d uri (Pos 3 0) #t))
+    (check-eq? (Doc-contribution d) accepted-contribution)
+    (check-equal? (Document-Reference-Result-module-binding after-edit)
+                  module-binding)
+    (define live-ranges
+      (map Location-range
+           (Reference-Source-locations
+             (Document-Reference-Result-source after-edit))))
+    (check-equal?
+      live-ranges
+      (list (Range (Pos 2 8) (Pos 2 9))
+            (Range (Pos 3 0) (Pos 3 1))
+            (Range (Pos 4 0) (Pos 4 1)))))
 
   (test-case
     "doc-highlights for local x"
     (define-values (d _uri) (make-expanded-doc))
-    ;; "x" usage at (2,0): highlights should include both usage and declaration
+    ;; "x" usage at (2,0): highlights should include both declaration and usage
     (define result (doc-highlights d (Pos 2 0)))
     (check-equal? (length result) 2)
-    ;; First highlight: the usage (binding) at line 2
+    ;; First highlight: the declaration at line 1
     (check-equal? (DocumentHighlight-range (first result))
-                  (Range (Pos 2 0) (Pos 2 1)))
-    ;; Second highlight: the declaration at line 1
+                  (Range (Pos 1 8) (Pos 1 9)))
+    ;; Second highlight: the usage at line 2
     (check-equal? (DocumentHighlight-range (second result))
-                  (Range (Pos 1 8) (Pos 1 9))))
+                  (Range (Pos 2 0) (Pos 2 1))))
+
+  (test-case
+    "doc-highlights returns empty for quoted data"
+    (define d
+      (make-doc "file:///tmp/doc-quoted-data-highlight-test.rkt"
+                (string-append "#lang racket\n"
+                               "(define x 1)\n"
+                               "x\n"
+                               "(quote x)\n"
+                               "'x\n")))
+    (check-true (doc-expand! d))
+    (check-equal? (doc-highlights d (Pos 3 7)) '())
+    (check-equal? (doc-highlights d (Pos 4 1)) '()))
+
+  (test-case
+    "doc-highlights keeps unused shadowed binders separate"
+    (define uri "file:///tmp/doc-unused-binder-highlight-test.rkt")
+    (define d
+      (make-doc uri
+                (string-append "#lang racket\n"
+                               "(define x 1)\n"
+                               "(let ([x 0])\n"
+                               "  1)\n"
+                               "(lambda (x) 1)\n")))
+    (check-true (doc-expand! d))
+
+    (define module-range (Range (Pos 1 8) (Pos 1 9)))
+    (define let-range (Range (Pos 2 7) (Pos 2 8)))
+    (define lambda-range (Range (Pos 4 9) (Pos 4 10)))
+    ;; Check Syntax before Racket 8.11 does not report unused lexical binders.
+    (define expected-let-ranges
+      (if unused-binder-callbacks? (list let-range) '()))
+    (define expected-lambda-ranges
+      (if unused-binder-callbacks? (list lambda-range) '()))
+    (check-equal? (map DocumentHighlight-range (doc-highlights d (Pos 1 8)))
+                  (list module-range))
+    (check-equal? (map DocumentHighlight-range (doc-highlights d (Pos 2 7)))
+                  expected-let-ranges)
+    (check-equal? (map DocumentHighlight-range (doc-highlights d (Pos 4 9)))
+                  expected-lambda-ranges)
+    (check-true (Module-Binding? (doc-module-binding-at d (Pos 1 8))))
+    (check-false (doc-module-binding-at d (Pos 2 7)))
+    (check-false (doc-module-binding-at d (Pos 4 9))))
+
+  (test-case
+    "doc-highlights uses non-empty module-language arrow ranges"
+    (define uri "file:///tmp/doc-module-language-highlight-test.rkt")
+    (define d
+      (make-doc uri
+                (string-append "#lang racket\n"
+                               "(define i+1-th 0)\n"
+                               "(+ 1 2)\n"
+                               "(+ i+1-th 3)\n")))
+    (check-true (doc-expand! d))
+    (define result (doc-highlights d (Pos 2 1)))
+    (check-equal? (map DocumentHighlight-range result)
+                  (list (Range (Pos 2 1) (Pos 2 2))
+                        (Range (Pos 3 1) (Pos 3 2)))))
+
+  (test-case
+    "doc-highlights accepts quote ranges from module-language arrows"
+    (define uri "file:///tmp/doc-module-language-quote-test.rkt")
+    (define d
+      (make-doc uri
+                "#lang racket\n'(1 2)\n'(3 4)\n"))
+    (check-true (doc-expand! d))
+    (check-equal?
+      (map DocumentHighlight-range (doc-highlights d (Pos 1 0)))
+      (list (Range (Pos 1 0) (Pos 1 1))
+            (Range (Pos 2 0) (Pos 2 1)))))
+
+  (test-case
+    "module-language uses stay local, non-defining, and binding-aware"
+    (define uri "file:///tmp/doc-module-language-use-test.rkt")
+    (define d
+      (make-doc uri
+                (string-append "#lang racket\n"
+                               "(define i+1-th 0)\n"
+                               "(+ 1 2)\n"
+                               "(* 3 4)\n"
+                               "(let ([+ -])\n"
+                               "  (+ 5 2))\n"
+                               "(+ i+1-th 3)\n")))
+    (check-true (doc-expand! d))
+
+    (define imported-plus-ranges
+      (list (Range (Pos 2 1) (Pos 2 2))
+            (Range (Pos 6 1) (Pos 6 2))))
+    (check-equal?
+      (map DocumentHighlight-range (doc-highlights d (Pos 2 1)))
+      imported-plus-ranges)
+    (check-equal?
+      (map DocumentHighlight-range (doc-highlights d (Pos 3 1)))
+      (list (Range (Pos 3 1) (Pos 3 2))))
+    (check-equal?
+      (map DocumentHighlight-range (doc-highlights d (Pos 5 3)))
+      (list (Range (Pos 4 7) (Pos 4 8))
+            (Range (Pos 5 3) (Pos 5 4))))
+
+    (define references (doc-references d uri (Pos 2 1) #t))
+    (check-false (Document-Reference-Result-module-binding references))
+    (check-equal?
+      (map Location-range
+           (Reference-Source-locations
+             (Document-Reference-Result-source references)))
+      imported-plus-ranges)
+    (check-false (doc-definition d uri (Pos 2 1)))
+    (check-false (doc-prepare-rename d (Pos 2 1)))
+    (check-false (doc-rename d uri (Pos 2 1) "plus"))
+
+    (define contribution-ranges
+      (for*/list ([locations (in-hash-values
+                               (Doc-Contribution-references (Doc-contribution d)))]
+                  [location (in-list locations)])
+        (Location-range location)))
+    (for ([range (in-list imported-plus-ranges)])
+      (check-false (member range contribution-ranges)))
+
+    (doc-apply-edit! d (Range (Pos 2 0) (Pos 2 0)) ";; shift\n")
+    (check-equal?
+      (map DocumentHighlight-range (doc-highlights d (Pos 3 1)))
+      (list (Range (Pos 3 1) (Pos 3 2))
+            (Range (Pos 7 1) (Pos 7 2)))))
+
+  (test-case
+    "module-language use collection filters and defers endpoints"
+    (define path (string->path "/tmp/module-language-use-service-test.rkt"))
+    (define uri (path->uri path))
+    (define text "racket + * ' word")
+    (define doc-text (new lsp-editor%))
+    (send doc-text insert text 0)
+    (define trace
+      (new build-trace%
+        [src path]
+        [doc-text doc-text]
+        [lexer-state (build-lexer-state text uri)]))
+    (define declaration-service (send trace get-declaration))
+
+    (send trace syncheck:add-arrow/name-dup path 0 6 path 7 8 #t 0 'module-lang #f)
+    (send trace syncheck:add-arrow/name-dup path 0 6 path 9 10 #t 0 'module-lang #f)
+    (send trace syncheck:add-arrow/name-dup path 0 6 path 11 12 #t 0 'module-lang #f)
+    (send trace syncheck:add-arrow/name-dup path 0 6 path 13 13 #t 0 'module-lang #f)
+    (send trace syncheck:add-arrow/name-dup path 0 6 path 13 17 #t 0 #t #f)
+    (send declaration-service walk-stx #f)
+
+    (check-equal? (send declaration-service occurrence-at 7)
+                  (CharRange 7 8))
+    (check-equal? (send declaration-service occurrence-at 9)
+                  (CharRange 9 10))
+    (check-equal? (send declaration-service occurrence-at 11)
+                  (CharRange 11 12))
+    (check-false (send declaration-service occurrence-at 13))
+    (check-equal? (send declaration-service uses-at 7)
+                  (list (CharRange 7 8)))
+    (check-false (send declaration-service definition-at 7))
+    (check-false (send declaration-service module-binding-at 7)))
+
+  (test-case
+    "exact jumps win over pending module-language uses"
+    (define path (string->path "/tmp/module-language-use-jump-test.rkt"))
+    (define uri (path->uri path))
+    (define text "racket exact")
+    (define doc-text (new lsp-editor%))
+    (send doc-text insert text 0)
+    (define trace
+      (new build-trace%
+        [src path]
+        [doc-text doc-text]
+        [lexer-state (build-lexer-state text uri)]))
+    (send trace syncheck:add-arrow/name-dup path 0 6 path 7 12 #t 0 'module-lang #f)
+    (send trace
+          syncheck:add-jump-to-definition/phase-level+space
+          path 7 12 'exact path '(provider) 0)
+    (define declaration-service (send trace get-declaration))
+    (send declaration-service walk-stx #f)
+    (check-equal? (send declaration-service module-binding-at 7)
+                  (Module-Binding path '(provider) 0 'exact))
+    (check-equal? (send declaration-service uses-at 7)
+                  (list (CharRange 7 12))))
+
+  (test-case
+    "explicit import variants keep exact full-token binding ranges"
+    (define cases
+      (list
+        (list 'plain
+              "#lang racket/base\n(require racket/list)\n(add-between '(1 2) 0)\n"
+              (Pos 2 1) (Pos 2 12) (Pos 1 9))
+        (list 'only
+              (string-append "#lang racket/base\n"
+                             "(require (only-in racket/list add-between))\n"
+                             "(add-between '(1 2) 0)\n")
+              (Pos 2 1) (Pos 2 12) (Pos 1 18))
+        (list 'renamed
+              (string-append "#lang racket/base\n"
+                             "(require (rename-in racket/list "
+                             "[add-between list-add-between]))\n"
+                             "(list-add-between '(1 2) 0)\n")
+              (Pos 2 1) (Pos 2 17) (Pos 1 39))
+        (list 'prefixed
+              (string-append "#lang racket/base\n"
+                             "(require (prefix-in l: racket/list))\n"
+                             "(l:add-between '(1 2) 0)\n")
+              (Pos 2 1) (Pos 2 14) (Pos 1 20))))
+
+    (for ([entry (in-list cases)])
+      (match-define (list name text use-start use-end import-position) entry)
+      (define uri (format "file:///tmp/~a-import-regression-test.rkt" name))
+      (define d (make-doc uri text))
+      (check-true (doc-expand! d))
+      (check-equal? (doc-occurrence-at d use-start)
+                    (Range use-start use-end))
+      (check-true (Module-Binding? (doc-module-binding-at d use-start)))
+      (check-false (doc-occurrence-at d import-position))
+      (check-false (doc-definition-at d import-position))))
 
   (test-case
     "doc-rename local x to y"
@@ -1661,8 +2369,8 @@ END
           "```rhombus\n// Converts the value.\nfun documented(value): value\n```\n\n"
           "**Mouse-over status**\n\n"
           "no bound occurrences"))
-      ;; A bound use must find detail through `declaration-at`, not only through
-      ;; definition targets.
+      ;; A bound use must find detail through `occurrence-at`, not only
+      ;; through definition targets.
       (define use-d
         (make-doc "file:///tmp/hover-detail-use.rhm"
                   "#lang rhombus\nfun parse_value(raw): raw\nparse_value(1)\n"))
